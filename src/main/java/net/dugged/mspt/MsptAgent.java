@@ -331,14 +331,21 @@ public final class MsptAgent {
 		return new File(MsptAgent.class.getProtectionDomain().getCodeSource().getLocation().toURI()).getAbsolutePath();
 	}
 
-	private record Snapshot(String mspt, String fingerprint) {
+	private static final class Snapshot {
+		final String mspt;
+		final String fingerprint;
+
+		Snapshot(String mspt, String fingerprint) {
+			this.mspt = mspt;
+			this.fingerprint = fingerprint;
+		}
 
 		static Snapshot parse(String line) throws IOException {
-				int separator = line.indexOf('|');
-				if (separator <= 0 || separator == line.length() - 1) {
-					throw new IOException("invalid agent response: " + line);
-				}
-				return new Snapshot(line.substring(0, separator), line.substring(separator + 1));
+			int separator = line.indexOf('|');
+			if (separator <= 0 || separator == line.length() - 1) {
+				throw new IOException("invalid agent response: " + line);
 			}
+			return new Snapshot(line.substring(0, separator), line.substring(separator + 1));
 		}
+	}
 }
