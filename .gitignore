@@ -2,3 +2,5 @@
 *.iml
 testserver
 result
+build/
+__pycache__/
