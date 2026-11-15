@@ -177,8 +177,11 @@ func (in *Instance) chat(user, msg string) {
 			in.tellraw(text{"text": u, "color": "gray", "clickEvent": text{"action": "open_url", "value": u}})
 		}
 	}
-	switch strings.ToLower(strings.TrimSpace(msg)) {
-	case "!tps":
+	if !strings.HasPrefix(msg, "!") {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(strings.TrimLeft(msg, "!"))) { // "!tps", "!!tps", ...
+	case "tps":
 		if in.TPS {
 			if ms, ok := in.avgMSPT(100); ok {
 				in.tellraw(gray(fmt.Sprintf("TPS: %.1f  MSPT: %.1f", min(20, 1000/ms), ms)))
@@ -186,11 +189,11 @@ func (in *Instance) chat(user, msg string) {
 				in.tellraw(gray("TPS: n/a"))
 			}
 		}
-	case "!twitch on":
+	case "twitch on":
 		if in.Twitch {
 			twitchSet(true)
 		}
-	case "!twitch off":
+	case "twitch off":
 		if in.Twitch {
 			twitchSet(false)
 		}
