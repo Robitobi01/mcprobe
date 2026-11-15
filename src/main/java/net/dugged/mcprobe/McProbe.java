@@ -18,6 +18,7 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import one.profiler.AsyncProfiler;
 
 /**
  * Java agent for Minecraft 1.12.2 servers (vanilla, carpet). Publishes tick times, loaded chunks
@@ -55,10 +56,15 @@ public final class McProbe implements Runnable {
 	private Field tickTimes;
 	private Field tickCount;
 	private boolean keyWritten;
+	private final String profilerLib, profilerEvent;
+	private AsyncProfiler profiler; // loaded on first use
+	private long profileStart, nextProfile;
 	private long lastChunks;
 	private String lastError;
 
-	private McProbe(Path dir, long ticksMillis, long chunksMillis, boolean key) {
+	private McProbe(Path dir, long ticksMillis, long chunksMillis, boolean key, String profilerLib, String profilerEvent) {
+		this.profilerLib = profilerLib;
+		this.profilerEvent = profilerEvent;
 		this.dir = dir;
 		this.ticksMillis = ticksMillis;
 		this.chunksMillis = chunksMillis;
@@ -72,6 +78,7 @@ public final class McProbe implements Runnable {
 			String dir = null;
 			long ticks = 1000, chunks = 1000;
 			boolean key = false;
+			String profiler = null, profilerEvent = "itimer";
 			for (String part : (args == null ? "" : args).split(",")) {
 				String[] kv = part.trim().split("=", 2);
 				if (kv.length != 2) continue;
@@ -80,11 +87,13 @@ public final class McProbe implements Runnable {
 					case "ticks": ticks = Long.parseLong(kv[1].trim()); break;
 					case "chunks": chunks = Long.parseLong(kv[1].trim()); break;
 					case "key": key = Boolean.parseBoolean(kv[1].trim()); break;
+					case "profiler": profiler = kv[1].trim(); break;
+					case "profilerEvent": profilerEvent = kv[1].trim(); break;
 					default: log("ignoring unknown option " + kv[0]);
 				}
 			}
 			if (dir == null) throw new IllegalArgumentException("missing dir=<directory>");
-			McProbe probe = new McProbe(Paths.get(dir), ticks, chunks, key);
+			McProbe probe = new McProbe(Paths.get(dir), ticks, chunks, key, profiler, profilerEvent);
 			Files.createDirectories(probe.dir);
 			probe.cleanup();
 			Runtime.getRuntime().addShutdownHook(new Thread(probe::cleanup, "mcprobe-cleanup"));
@@ -125,6 +134,7 @@ public final class McProbe implements Runnable {
 					if (key && !keyWritten) writeKey();
 					long next = Math.min(ticksMillis > 0 ? nextTicks : Long.MAX_VALUE,
 							chunksMillis > 0 ? nextChunks : Long.MAX_VALUE);
+					if (profilerLib != null) next = Math.min(next, profile(now));
 					sleep = Math.max(10, Math.min(1000, next - System.currentTimeMillis()));
 				}
 				lastError = null;
@@ -274,6 +284,49 @@ public final class McProbe implements Runnable {
 		keyWritten = true;
 	}
 
+	// --- profiler ---------------------------------------------------------------------------
+
+	private static final long PROFILE_EVERY = 1000;   // ms between profile.collapsed updates
+	private static final long PROFILE_IDLE = 30_000;  // stop when profile.request is older
+
+	/**
+	 * On-demand profiling of the server thread with async-profiler (CPU time (itimer), 2 ms per sample, stacks per thread; no attach, no safepoints):
+	 * while a reader keeps touching profile.request, the stacks sampled since the start are written
+	 * to profile.collapsed ("# start=<ms>" + collapsed stacks) every second; the sampling itself and
+	 * building the dump happen outside the server thread. Returns the next due time.
+	 */
+	private long profile(long now) throws Exception {
+		long requested;
+		try {
+			requested = Files.getLastModifiedTime(dir.resolve("profile.request")).toMillis();
+		} catch (IOException noRequest) {
+			requested = 0;
+		}
+		boolean wanted = now - requested < PROFILE_IDLE;
+		if (!wanted) {
+			if (profileStart != 0) {
+				profiler.execute("stop");
+				profileStart = 0;
+				Files.deleteIfExists(dir.resolve("profile.collapsed"));
+				log("profiler stopped");
+			}
+			return now + PROFILE_EVERY;
+		}
+		if (profileStart == 0) {
+			if (profiler == null) profiler = AsyncProfiler.getInstance(profilerLib);
+			// all threads, each stack prefixed with its thread; mcprobe-web selects the server thread
+			profiler.execute("start,event=" + profilerEvent + ",interval=2ms,threads");
+			profileStart = now;
+			nextProfile = now;
+			log("profiler started");
+		}
+		if (now >= nextProfile) {
+			write("profile.collapsed", "# start=" + profileStart + "\n" + profiler.execute("collapsed,samples,sig"), false);
+			nextProfile = now + PROFILE_EVERY;
+		}
+		return nextProfile;
+	}
+
 	private StringBuilder header(long now) {
 		return new StringBuilder(4096).append("{\"pid\":").append(pid).append(",\"time\":").append(now);
 	}
@@ -354,7 +407,7 @@ public final class McProbe implements Runnable {
 	}
 
 	private void cleanup() {
-		for (String name : new String[] { "ticks.json", "chunks.json", "key.json" }) {
+		for (String name : new String[] { "ticks.json", "chunks.json", "key.json", "profile.collapsed" }) {
 			try {
 				Files.deleteIfExists(dir.resolve(name));
 			} catch (IOException ignored) {

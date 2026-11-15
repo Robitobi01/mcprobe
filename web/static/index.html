@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mcprobe</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1 id="title">mcprobe</h1>
+  <div class="stat"><span id="mspt">–</span><small>MSPT</small></div>
+  <canvas id="ticks" width="300" height="44" title="last 99 ticks (red: over 50 ms)"></canvas>
+  <label>window
+    <select id="window">
+      <option value="10">10 s</option>
+      <option value="30" selected>30 s</option>
+      <option value="60">1 min</option>
+      <option value="300">5 min</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="idle" checked> hide idle</label>
+  <button id="pause">pause</button>
+  <input id="search" type="search" placeholder="search (regex)">
+  <span id="status"></span>
+</header>
+<nav id="crumbs"></nav>
+<main>
+  <canvas id="flame"></canvas>
+  <div id="tip"></div>
+</main>
+<section>
+  <h2>Self time</h2>
+  <table id="self"><thead><tr><th>method</th><th>ms/tick</th><th>%</th></tr></thead><tbody></tbody></table>
+</section>
+<script src="app.js"></script>
+</body>
+</html>
