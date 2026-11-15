@@ -13,22 +13,20 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.KeyPair;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Callable;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Java agent for Minecraft 1.12.2 servers (vanilla, carpet). Publishes tick times, loaded chunks
  * and optionally the server key pair as small files in a directory (meant for tmpfs, e.g. /run).
  *
- * <pre>java -javaagent:mcprobe.jar=dir=/run/mcprobe/survival[,ticks=1000][,chunks=10000][,key=true] -jar server.jar</pre>
+ * <pre>java -javaagent:mcprobe.jar=dir=/run/mcprobe/survival[,ticks=1000][,chunks=1000][,key=true] -jar server.jar</pre>
  *
- * Read-only: no class transformation, nothing is written into the server. All work happens on one
- * low-priority daemon thread; only the chunk snapshot (copying coordinates) runs on the server thread.
+ * Read-only: no class transformation, nothing is written into the server, and no work is ever
+ * scheduled on the server thread: everything runs on one low-priority daemon thread.
  * The agent never prevents the server from starting: every error is logged and swallowed.
  */
 public final class McProbe implements Runnable {
@@ -39,13 +37,13 @@ public final class McProbe implements Runnable {
 	private static final String F_WORLDS = "d";       // MinecraftServer.worlds         WorldServer[]
 	private static final String M_STOPPED = "al";     // MinecraftServer.isServerStopped()
 	private static final String M_KEY_PAIR = "O";     // MinecraftServer.getKeyPair()
-	private static final String M_SCHEDULE = "a";     // MinecraftServer.callFromMainThread(Callable)
 	private static final String F_PROVIDER = "s";     // World.provider
 	private static final String M_DIM_TYPE = "q";     // WorldProvider.getDimensionType()
 	private static final String M_DIM_ID = "a";       // DimensionType.getId()
 	private static final String M_DIM_NAME = "b";     // DimensionType.getName()
 	private static final String M_CHUNK_PROVIDER = "r"; // WorldServer.getChunkProvider()
-	private static final String F_CHUNK_MAP = "e";    // ChunkProviderServer.loadedChunks  Long2ObjectMap<Chunk>
+	private static final String F_CHUNK_MAP = "e";    // ChunkProviderServer.loadedChunks  Long2ObjectOpenHashMap<Chunk>
+	// (fastutil's own fields key/value/size are not obfuscated)
 
 	private final Path dir;
 	private final long ticksMillis;
@@ -57,6 +55,7 @@ public final class McProbe implements Runnable {
 	private Field tickTimes;
 	private Field tickCount;
 	private boolean keyWritten;
+	private long lastChunks;
 	private String lastError;
 
 	private McProbe(Path dir, long ticksMillis, long chunksMillis, boolean key) {
@@ -71,7 +70,7 @@ public final class McProbe implements Runnable {
 	public static void premain(String args, Instrumentation inst) {
 		try {
 			String dir = null;
-			long ticks = 1000, chunks = 10000;
+			long ticks = 1000, chunks = 1000;
 			boolean key = false;
 			for (String part : (args == null ? "" : args).split(",")) {
 				String[] kv = part.trim().split("=", 2);
@@ -144,55 +143,123 @@ public final class McProbe implements Runnable {
 
 	// --- data -------------------------------------------------------------------------------
 
+	/**
+	 * The server increments its tick counter at the start of a tick but stores the tick's duration
+	 * at the end, so the slot of the current tick is ambiguous from outside (finished, or still the
+	 * value from 100 ticks ago). Only ticks that are certainly finished are published: up to the
+	 * last 99, oldest first, without the never-written slots after startup.
+	 */
 	private void writeTicks(long now) throws Exception {
-		long[] ring = ((long[]) tickTimes.get(server)).clone();
-		int newest = Math.floorMod(tickCount.getInt(server), ring.length);
-		StringBuilder json = header(now).append(",\"tick\":").append(tickCount.getInt(server));
-		json.append(",\"tickNanos\":[");
-		for (int i = 1; i <= ring.length; i++) { // oldest -> newest
-			if (i > 1) json.append(',');
-			json.append(ring[(newest + i) % ring.length]);
+		long[] ring;
+		int tick;
+		do { // retry if a tick ended while copying
+			tick = tickCount.getInt(server);
+			ring = ((long[]) tickTimes.get(server)).clone();
+		} while (tickCount.getInt(server) != tick);
+		int count = Math.max(0, Math.min(ring.length - 1, tick - 1));
+		StringBuilder json = header(now).append(",\"tick\":").append(tick).append(",\"tickNanos\":[");
+		for (int t = tick - count; t < tick; t++) { // ticks tick-count .. tick-1
+			if (t > tick - count) json.append(',');
+			json.append(ring[Math.floorMod(t, ring.length)]);
 		}
 		write("ticks.json", json.append("]}\n").toString(), false);
 	}
 
 	private void writeChunks(long now) throws Exception {
-		Object srv = server;
-		Method schedule = srv.getClass().getMethod(M_SCHEDULE, Callable.class);
-		// The chunk map is not thread-safe: on the server thread only copy its keys
-		// (one long per chunk, x in the low and z in the high 32 bits) with a single
-		// toLongArray(); decoding and JSON happen here, off the server thread.
-		Callable<List<Object[]>> task = () -> {
-			List<Object[]> dims = new ArrayList<>();
-			for (Object world : (Object[]) field(srv, F_WORLDS)) {
-				if (world == null) continue;
-				Object type = invoke(field(world, F_PROVIDER), M_DIM_TYPE);
-				Object keys = invoke(field(invoke(world, M_CHUNK_PROVIDER), F_CHUNK_MAP), "keySet");
-				dims.add(new Object[] { invoke(type, M_DIM_ID), invoke(type, M_DIM_NAME), invoke(keys, "toLongArray") });
-			}
-			return dims;
-		};
-		Future<?> future = (Future<?>) schedule.invoke(srv, task);
-		List<?> dims;
-		try {
-			dims = (List<?>) future.get(5, TimeUnit.SECONDS);
-		} finally {
-			future.cancel(false);
+		List<Object[]> dims = new ArrayList<>();
+		for (Object world : (Object[]) field(server, F_WORLDS)) {
+			if (world == null) continue;
+			Object type = invoke(field(world, F_PROVIDER), M_DIM_TYPE);
+			long[] keys = readKeys(field(invoke(world, M_CHUNK_PROVIDER), F_CHUNK_MAP));
+			if (keys == null) return; // map kept changing while reading: try again next interval
+			dims.add(new Object[] { invoke(type, M_DIM_ID), invoke(type, M_DIM_NAME), keys });
 		}
+
+		// skip the write if no dimension's set of loaded chunks changed (keys are sorted)
+		long fingerprint = dims.size();
+		for (Object entry : dims) {
+			Object[] dim = (Object[]) entry;
+			long[] keys = (long[]) dim[2];
+			fingerprint = fingerprint * 31 + (Integer) dim[0];
+			for (long key : keys) fingerprint = fingerprint * 31 + key;
+		}
+		if (fingerprint == lastChunks) return;
+
 		StringBuilder json = header(now).append(",\"dimensions\":[");
 		for (int d = 0; d < dims.size(); d++) {
 			Object[] dim = (Object[]) dims.get(d);
 			long[] keys = (long[]) dim[2];
+			StringBuilder chunks = new StringBuilder(keys.length * 10), lazy = new StringBuilder();
+			int lazyCount = 0;
+			for (long key : keys) {
+				int x = (int) key, z = (int) (key >>> 32);
+				String xz = "[" + x + "," + z + "]";
+				if (chunks.length() > 0) chunks.append(',');
+				chunks.append(xz);
+				if (!entityProcessing(keys, x, z)) {
+					if (lazy.length() > 0) lazy.append(',');
+					lazy.append(xz);
+					lazyCount++;
+				}
+			}
 			if (d > 0) json.append(',');
 			json.append("{\"id\":").append(dim[0]).append(",\"name\":\"").append(dim[1])
-					.append("\",\"loaded\":").append(keys.length).append(",\"chunks\":[");
-			for (int i = 0; i < keys.length; i++) {
-				if (i > 0) json.append(',');
-				json.append('[').append((int) keys[i]).append(',').append((int) (keys[i] >>> 32)).append(']');
-			}
-			json.append("]}");
+					.append("\",\"loaded\":").append(keys.length).append(",\"lazy\":").append(lazyCount)
+					.append(",\"chunks\":[").append(chunks).append("],\"lazyChunks\":[").append(lazy).append("]}");
 		}
 		write("chunks.json", json.append("]}\n").toString(), false);
+		lastChunks = fingerprint;
+	}
+
+	/**
+	 * Reads the keys of the chunk map (fastutil Long2ObjectOpenHashMap) from this thread, without
+	 * involving the server thread at all. The map is not thread-safe, so a read can overlap a chunk
+	 * load/unload; such a read is detected (arrays replaced, size changed, entry count or duplicates
+	 * not matching) and retried after a short pause; the server only changes the map at certain
+	 * points of a tick and not while it sleeps between ticks. Returns sorted keys, or null if no
+	 * consistent read succeeded within ~100 ms.
+	 */
+	private static long[] readKeys(Object map) throws Exception {
+		for (int attempt = 0; attempt < 50; attempt++) {
+			if (attempt > 0) Thread.sleep(2);
+			int size = (Integer) field(map, "size");
+			long[] key = (long[]) field(map, "key");
+			Object[] value = (Object[]) field(map, "value");
+			if (key.length != value.length) continue; // caught in the middle of a rehash
+			long[] out = new long[size];
+			int n = 0;
+			for (int i = 0; i < key.length && n <= size; i++) {
+				if (value[i] == null) continue;
+				if (n == size) { n++; break; } // more entries than size: inconsistent
+				out[n++] = key[i];
+			}
+			if (n != size || field(map, "key") != key || field(map, "value") != value
+					|| (Integer) field(map, "size") != size) continue;
+			Arrays.sort(out);
+			boolean duplicate = false;
+			for (int i = 1; i < out.length && !duplicate; i++) duplicate = out[i] == out[i - 1];
+			if (!duplicate) return out;
+		}
+		return null;
+	}
+
+	/**
+	 * 1.12 updates an entity only if every chunk within 2 chunks of it is loaded
+	 * (World.updateEntityWithOptionalForce checks a +-32 block area). Loaded chunks
+	 * failing this are "lazy": blocks and tile entities tick, entities do not.
+	 */
+	private static boolean entityProcessing(long[] sortedKeys, int x, int z) {
+		for (int dx = -2; dx <= 2; dx++) {
+			for (int dz = -2; dz <= 2; dz++) {
+				if (Arrays.binarySearch(sortedKeys, chunkKey(x + dx, z + dz)) < 0) return false;
+			}
+		}
+		return true;
+	}
+
+	/** ChunkPos.asLong: x in the low, z in the high 32 bits. */
+	private static long chunkKey(int x, int z) {
+		return (x & 0xFFFFFFFFL) | (z & 0xFFFFFFFFL) << 32;
 	}
 
 	private void writeKey() throws Exception {
@@ -249,7 +316,7 @@ public final class McProbe implements Runnable {
 		return null;
 	}
 
-	// Reflection lookups are cached: they would otherwise dominate the time spent on the server thread.
+	// Reflection lookups are cached: they would otherwise dominate the agent's own time.
 	private static final Map<String, Field> FIELDS = new ConcurrentHashMap<>();
 	private static final Map<String, Method> METHODS = new ConcurrentHashMap<>();
 
@@ -269,7 +336,7 @@ public final class McProbe implements Runnable {
 		Method method = METHODS.get(type.getName() + "." + name);
 		if (method == null) {
 			method = type.getMethod(name);
-			method.setAccessible(true); // public methods of non-public classes (fastutil key sets)
+			method.setAccessible(true);
 			METHODS.put(type.getName() + "." + name, method);
 		}
 		return method.invoke(target);
