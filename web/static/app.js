@@ -10,18 +10,10 @@ let data = null, focusPath = [], paused = false, regex = null, hits = [];
 
 // --- data ---------------------------------------------------------------------------------
 
-// Idle: the main loop sleeping between ticks (MinecraftServer.run -> Thread.sleep).
-function withoutIdle(node) {
-  const kids = (node.c || [])
-    .filter((c) => !(node.n === "MinecraftServer.run" && /^Thread\.sleep/.test(c.n)))
-    .map(withoutIdle);
-  const v = (node.s || 0) + kids.reduce((a, c) => a + c.v, 0);
-  return { n: node.n, v, s: node.s || 0, c: kids.filter((c) => c.v > 0) };
-}
-
+// CPU-time samples: the main loop sleeping between ticks takes no samples, so the tree
+// only contains time the server thread actually spent working.
 function view() {
-  if (!data || !data.tree) return null;
-  return $("idle").checked ? withoutIdle(data.tree) : data.tree;
+  return data && data.tree ? data.tree : null;
 }
 
 function find(root, path) {
@@ -193,7 +185,6 @@ $("pause").onclick = () => {
   paused = !paused;
   $("pause").textContent = paused ? "resume" : "pause";
 };
-$("idle").onchange = render;
 $("window").onchange = () => { paused = false; $("pause").textContent = "pause"; connect(); };
 $("search").oninput = (e) => {
   try { regex = e.target.value ? new RegExp(e.target.value, "i") : null; } catch { regex = null; }
