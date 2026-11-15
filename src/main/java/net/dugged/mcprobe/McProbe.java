@@ -314,14 +314,15 @@ public final class McProbe implements Runnable {
 		}
 		if (profileStart == 0) {
 			if (profiler == null) profiler = AsyncProfiler.getInstance(profilerLib);
-			// all threads, each stack prefixed with its thread; mcprobe-web selects the server thread
+			// all threads are sampled (thread filters do not work with itimer); stacks carry their thread
+			// as first frame and the dumps keep only the server thread (include=)
 			profiler.execute("start,event=" + profilerEvent + ",interval=2ms,threads");
 			profileStart = now;
 			nextProfile = now;
 			log("profiler started");
 		}
 		if (now >= nextProfile) {
-			write("profile.collapsed", "# start=" + profileStart + "\n" + profiler.execute("collapsed,samples,sig"), false);
+			write("profile.collapsed", "# start=" + profileStart + "\n" + profiler.execute("collapsed,samples,sig,include=*Server thread*"), false);
 			nextProfile = now + PROFILE_EVERY;
 		}
 		return nextProfile;

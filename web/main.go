@@ -47,7 +47,11 @@ import (
 //go:embed static
 var static embed.FS
 
-const keepHistory = 10 * time.Minute
+const (
+	keepHistory   = 5*time.Minute + 15*time.Second // largest window (5 min) plus slack
+	snapshotEvery = 5 * time.Second                // history granularity for window bases
+	serverThread  = "Server thread"
+)
 
 type snapshot struct {
 	at     time.Time
@@ -57,10 +61,17 @@ type snapshot struct {
 type instance struct {
 	dir     string
 	mu      sync.Mutex
-	start   int64 // profile start (ms) of the snapshots in hist
-	mtime   time.Time
-	hist    []snapshot
+	start   int64     // profile start (ms) of the data below
+	mtime   time.Time // of the last read profile.collapsed
+	latest  snapshot
+	hist    []snapshot // sparse: one per snapshotEvery, at most keepHistory old
 	touched time.Time
+	cache   map[time.Duration]cachedProfile // per window, shared by all viewers
+}
+
+type cachedProfile struct {
+	mtime  time.Time
+	result map[string]any
 }
 
 type node struct {
@@ -176,17 +187,16 @@ func (m *mappings) translate(frame string) string {
 // --- profile data -----------------------------------------------------------------------
 
 // read parses profile.collapsed: "# start=<ms>" and "frame;frame;... count" lines.
-func readProfile(path string) (int64, map[string]int64, time.Time, error) {
-	st, err := os.Stat(path)
-	if err != nil {
-		return 0, nil, time.Time{}, err
-	}
+// readProfile parses profile.collapsed ("# start=<ms>", "[thread tid=N];frame;... count")
+// and keeps only the stacks of `thread`, without the thread frame.
+func readProfile(path, thread string) (int64, map[string]int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, nil, time.Time{}, err
+		return 0, nil, err
 	}
 	defer f.Close()
 	var start int64
+	prefix := "[" + thread + " tid="
 	counts := map[string]int64{}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1<<20), 16<<20)
@@ -196,15 +206,19 @@ func readProfile(path string) (int64, map[string]int64, time.Time, error) {
 			start, _ = strconv.ParseInt(line[8:], 10, 64)
 			continue
 		}
-		sp := strings.LastIndexByte(line, ' ')
-		if sp <= 0 {
+		if !strings.HasPrefix(line, prefix) {
 			continue
 		}
-		if n, err := strconv.ParseInt(line[sp+1:], 10, 64); err == nil {
-			counts[line[:sp]] += n
+		_, rest, ok := strings.Cut(line, ";")
+		sp := strings.LastIndexByte(rest, ' ')
+		if !ok || sp <= 0 {
+			continue
+		}
+		if n, err := strconv.ParseInt(rest[sp+1:], 10, 64); err == nil {
+			counts[rest[:sp]] += n
 		}
 	}
-	return start, counts, st.ModTime(), sc.Err()
+	return start, counts, sc.Err()
 }
 
 func (in *instance) touch() {
@@ -225,25 +239,40 @@ func (in *instance) touch() {
 }
 
 // window returns the counts of the last `window` and the time actually covered.
-func (in *instance) window(window time.Duration) (map[string]int64, time.Duration, bool) {
-	start, counts, mtime, err := readProfile(filepath.Join(in.dir, "profile.collapsed"))
+// refresh reads profile.collapsed only when the agent rewrote it.
+func (in *instance) refresh() bool {
+	path := filepath.Join(in.dir, "profile.collapsed")
+	st, err := os.Stat(path)
 	if err != nil {
-		return nil, 0, false
+		return false
 	}
-	if start != in.start { // profiler (re)started: old snapshots are from another run
-		in.start, in.hist = start, nil
+	if st.ModTime().Equal(in.mtime) {
+		return in.latest.counts != nil
 	}
-	if !mtime.Equal(in.mtime) {
-		in.mtime = mtime
-		in.hist = append(in.hist, snapshot{mtime, counts})
+	start, counts, err := readProfile(path, serverThread)
+	if err != nil {
+		return false
 	}
-	for len(in.hist) > 1 && time.Since(in.hist[0].at) > keepHistory {
+	if start != in.start { // profiler (re)started: old data is from another run
+		in.start, in.hist, in.cache = start, nil, nil
+	}
+	in.mtime = st.ModTime()
+	in.latest = snapshot{in.mtime, counts}
+	if n := len(in.hist); n == 0 || in.mtime.Sub(in.hist[n-1].at) >= snapshotEvery {
+		in.hist = append(in.hist, in.latest)
+	}
+	for len(in.hist) > 1 && in.mtime.Sub(in.hist[0].at) > keepHistory {
 		in.hist = in.hist[1:]
 	}
-	latest := in.hist[len(in.hist)-1]
+	return true
+}
+
+// window returns the counts of the last `window` and the time actually covered.
+func (in *instance) window(window time.Duration) (map[string]int64, time.Duration) {
+	latest := in.latest
 	// base: newest snapshot at least `window` older than the latest; else the profile start
 	var base map[string]int64
-	covered := latest.at.Sub(time.UnixMilli(start))
+	covered := latest.at.Sub(time.UnixMilli(in.start))
 	for i := len(in.hist) - 1; i >= 0; i-- {
 		if latest.at.Sub(in.hist[i].at) >= window {
 			base, covered = in.hist[i].counts, latest.at.Sub(in.hist[i].at)
@@ -256,21 +285,16 @@ func (in *instance) window(window time.Duration) (map[string]int64, time.Duratio
 			delta[stack] = d
 		}
 	}
-	return delta, covered, true
+	return delta, covered
 }
 
 // buildTree keeps the stacks of one thread; the agent prefixes each with "[<thread> tid=N]".
-func buildTree(counts map[string]int64, m *mappings, thread string) *node {
-	root := &node{Name: thread}
-	prefix := "[" + thread + " tid="
+func buildTree(counts map[string]int64, m *mappings, name string) *node {
+	root := &node{Name: name}
 	for stack, n := range counts {
-		first, rest, ok := strings.Cut(stack, ";")
-		if !ok || !strings.HasPrefix(first, prefix) {
-			continue
-		}
 		cur := root
 		cur.Value += n
-		for _, frame := range strings.Split(rest, ";") {
+		for _, frame := range strings.Split(stack, ";") {
 			cur = cur.child(m.translate(frame))
 			cur.Value += n
 		}
@@ -367,21 +391,31 @@ func windowParam(r *http.Request) time.Duration {
 }
 
 // profile keeps the agent profiling and returns the server thread's tree for the window.
+// profile keeps the agent profiling and returns the server thread's tree for the window;
+// the result is computed once per profile update and window, whatever the number of viewers.
 func (in *instance) profile(window time.Duration, m *mappings) map[string]any {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	in.touch()
-	counts, covered, ok := in.window(window)
-	if !ok {
+	if !in.refresh() {
 		return map[string]any{"status": "starting"}
 	}
-	return map[string]any{
+	if c, ok := in.cache[window]; ok && c.mtime.Equal(in.mtime) {
+		return c.result
+	}
+	counts, covered := in.window(window)
+	result := map[string]any{
 		"status":   "running",
 		"start":    in.start,
 		"interval": 2, // ms of CPU time per sample (agent: itimer, 2ms)
 		"covered":  covered.Seconds(),
-		"tree":     buildTree(counts, m, "Server thread"),
+		"tree":     buildTree(counts, m, serverThread),
 	}
+	if in.cache == nil {
+		in.cache = map[time.Duration]cachedProfile{}
+	}
+	in.cache[window] = cachedProfile{in.mtime, result}
+	return result
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
