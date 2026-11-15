@@ -1,4 +1,5 @@
-# mcprobe: the Java agent (share/java/mcprobe.jar) and the live viewer service (bin/mcprobe-web).
+# mcprobe: the Java agent (share/java/mcprobe.jar), the live viewer (bin/mcprobe-web)
+# and the in-game chat bridge (bin/mcprobe-chat).
 { lib, stdenvNoCC, buildGoModule, fetchurl, unzip, jdk8_headless }:
 let
   # MCP names for the 1.12.2 server (used by mcprobe-web to translate profiles)
@@ -16,6 +17,12 @@ let
     src = lib.fileset.toSource { root = ./web; fileset = ./web; };
     vendorHash = null; # standard library only
   };
+  chat = buildGoModule {
+    pname = "mcprobe-chat";
+    version = "0.4.0";
+    src = lib.fileset.toSource { root = ./chat; fileset = ./chat; };
+    vendorHash = null;
+  };
 in
 stdenvNoCC.mkDerivation {
   pname = "mcprobe";
@@ -31,6 +38,7 @@ stdenvNoCC.mkDerivation {
   installPhase = ''
     install -Dm444 build/mcprobe.jar $out/share/java/mcprobe.jar
     install -Dm555 ${web}/bin/mcprobe-web $out/bin/mcprobe-web
+    install -Dm555 ${chat}/bin/mcprobe-chat $out/bin/mcprobe-chat
     mkdir -p $out/share/mcprobe/mappings
     unzip -p ${srg} joined.srg > $out/share/mcprobe/mappings/joined.srg
     unzip -p ${names} methods.csv > $out/share/mcprobe/mappings/methods.csv
